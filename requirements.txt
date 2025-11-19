@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+httpx
+python-docx
+pydantic-settings
+python-dotenv
+agno
+groq
+pinecone==5.4.2
+fastembed
+sqlalchemy
+

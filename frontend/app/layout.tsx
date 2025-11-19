@@ -1,0 +1,20 @@
+import type { Metadata } from 'next'
+import './globals.css'
+
+export const metadata: Metadata = {
+  title: 'Fruitbowl Assistant',
+  description: 'Ask me about the Fruitbowl meetings and get detailed answers',
+}
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return (
+    <html lang="en" data-theme="dark">
+      <body>{children}</body>
+    </html>
+  )
+}
+
