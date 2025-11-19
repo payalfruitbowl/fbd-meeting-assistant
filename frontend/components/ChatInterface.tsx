@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { queryAgentStream, deleteSession, type Message } from '../lib/api'
+import { queryAgentStream, deleteSession, type Message } from './api'
 
 export default function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>([])
