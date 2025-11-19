@@ -2,6 +2,7 @@
 FastAPI main application entry point.
 """
 from fastapi import FastAPI, HTTPException
+from starlette.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import json
@@ -90,6 +91,28 @@ async def root():
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str, request: Request):
+    """Handle OPTIONS requests for CORS preflight."""
+    origin = request.headers.get("origin")
+    
+    # Check if origin is in allowed origins
+    if origin and origin in allowed_origins:
+        return JSONResponse(
+            content={},
+            headers={
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Max-Age": "3600",
+            }
+        )
+    else:
+        # Return 200 even if origin not in list (let middleware handle it)
+        return JSONResponse(content={})
 
 
 @app.get("/test-api")
