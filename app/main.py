@@ -33,12 +33,16 @@ app = FastAPI(
 # Parse allowed origins from environment variable (comma-separated)
 allowed_origins = [origin.strip() for origin in settings.CORS_ALLOWED_ORIGINS.split(",") if origin.strip()]
 
+# Log allowed origins for debugging
+logger.info(f"CORS allowed origins: {allowed_origins}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,  # Frontend URLs from environment
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],  # Explicit methods
     allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers
 )
 
 # Initialize session manager (singleton)
