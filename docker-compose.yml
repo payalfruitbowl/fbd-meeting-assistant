@@ -13,7 +13,7 @@ services:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - PINECONE_API_KEY=${PINECONE_API_KEY}
       - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME}
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-https://fbd-meeting-assistant-frontend.onrender.com}
       - OUTPUT_DIR=/app/output
       - DEBUG=${DEBUG:-false}
     volumes:

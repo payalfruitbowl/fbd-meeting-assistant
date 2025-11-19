@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     
     # CORS Configuration
     # Comma-separated list of allowed origins (e.g., "http://localhost:3000,https://your-frontend.onrender.com")
-    CORS_ALLOWED_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
+    CORS_ALLOWED_ORIGINS: str = "https://fbd-meeting-assistant-frontend.onrender.com"
     
     class Config:
         env_file = ".env"
