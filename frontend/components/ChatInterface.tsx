@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { queryAgentStream, deleteSession, type Message } from './api'
@@ -13,7 +13,16 @@ export default function ChatInterface() {
   const [isHomePage, setIsHomePage] = useState(true)
   const [theme, setTheme] = useState<'dark' | 'light'>('dark')
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null)
+  const homeInputRef = useRef<HTMLInputElement>(null)
+  const chatInputRef = useRef<HTMLTextAreaElement>(null)
+
+  const focusInput = useCallback(() => {
+    if (chatInputRef.current) {
+      chatInputRef.current.focus()
+      return
+    }
+    homeInputRef.current?.focus()
+  }, [])
 
   // Apply theme to document
   useEffect(() => {
@@ -117,7 +126,7 @@ export default function ChatInterface() {
             setSessionId(newSessionId)
           }
           setIsLoading(false)
-          inputRef.current?.focus()
+          focusInput()
         },
         (error: string) => {
           // Update last message with error
@@ -130,7 +139,7 @@ export default function ChatInterface() {
             return newMessages
           })
           setIsLoading(false)
-          inputRef.current?.focus()
+          focusInput()
         }
       )
     } catch (error) {
@@ -143,7 +152,7 @@ export default function ChatInterface() {
         return newMessages
       })
       setIsLoading(false)
-      inputRef.current?.focus()
+      focusInput()
     }
   }
 
@@ -235,7 +244,7 @@ export default function ChatInterface() {
             }}
           >
             <input
-              ref={inputRef}
+              ref={homeInputRef}
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -613,7 +622,7 @@ export default function ChatInterface() {
           }}
           >
             <textarea
-              ref={inputRef}
+              ref={chatInputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
