@@ -136,8 +136,8 @@ if __name__ == "__main__":
     # Today's date is November 17, 2025 (as specified by user)
     # Create datetime objects with time components (start of day for start, end of day for end)
     # This matches how test_pinecone_setup.py creates dates
-    START_DATE = datetime(2025, 1, 1, 0, 0, 0)  # Start of June 11, 2024
-    END_DATE = datetime(2025, 1, 10, 23, 59, 59)  # End of June 11, 2024
+    START_DATE = datetime(2025, 11, 19, 0, 0, 0)  # Start of June 11, 2024
+    END_DATE = datetime(2025, 11, 20, 23, 59, 59)  # End of June 11, 2024
     
     # Run the test (limit max is 50 per Fireflies API docs)
     asyncio.run(test_transcript_retrieval(START_DATE, END_DATE, limit=50))

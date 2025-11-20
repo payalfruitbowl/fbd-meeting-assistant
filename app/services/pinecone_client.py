@@ -287,4 +287,42 @@ class PineconeClient:
         except Exception as e:
             logger.error(f"Failed to list indexes: {e}")
             raise
+    
+    def query(
+        self,
+        vector: List[float],
+        top_k: int = 10,
+        filter_dict: Optional[Dict[str, Any]] = None,
+        include_metadata: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Query the index with a vector.
+        
+        Args:
+            vector: Query vector (embedding)
+            top_k: Number of results to return
+            filter_dict: Optional metadata filter
+            include_metadata: Whether to include metadata in results
+            
+        Returns:
+            Query results dictionary
+        """
+        if not self.index:
+            raise ValueError("No index connected. Create or connect to an index first.")
+        
+        try:
+            query_params = {
+                "vector": vector,
+                "top_k": top_k,
+                "include_metadata": include_metadata
+            }
+            
+            if filter_dict:
+                query_params["filter"] = filter_dict
+            
+            results = self.index.query(**query_params)
+            return results
+        except Exception as e:
+            logger.error(f"Failed to query index: {e}")
+            raise
 

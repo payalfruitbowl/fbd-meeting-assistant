@@ -9,13 +9,15 @@ import json
 from datetime import datetime, timedelta
 import logging
 from pydantic import BaseModel, Field
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Any
 
 from app.config import settings
 from app.services.fireflies_client import FirefliesClient
 from app.services.data_processor import DataProcessor
 from app.services.word_generator import WordGenerator
 from app.services.session_manager import SessionManager
+from app.services.pinecone_client import PineconeClient
+from app.services.transcript_cleaner import TranscriptCleaner
 
 # Configure logging
 logging.basicConfig(
@@ -485,3 +487,323 @@ async def get_sessions_count():
     except Exception as e:
         logger.error(f"Error getting sessions count: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting sessions count: {str(e)}")
+
+
+# Helper functions for daily sync (reused from backfill_transcripts.py)
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    """Split text into fixed-size chunks with overlap."""
+    if not text:
+        return []
+    
+    if len(text) <= chunk_size:
+        return [text]
+    
+    if overlap >= chunk_size:
+        overlap = chunk_size // 4
+    
+    chunks = []
+    start = 0
+    step = chunk_size - overlap
+    
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        if chunk.strip():
+            chunks.append(chunk)
+        start += step
+        if start >= len(text):
+            break
+    
+    return chunks
+
+
+def extract_transcript_text(transcript: Dict[str, Any], clean: bool = True) -> str:
+    """Extract formatted text from transcript sentences."""
+    if clean:
+        transcript = TranscriptCleaner.clean_transcript(transcript)
+        return TranscriptCleaner.format_cleaned_transcript_text(transcript)
+    
+    if "sentences" in transcript and transcript["sentences"]:
+        lines = []
+        for sentence in transcript["sentences"]:
+            speaker = sentence.get("speaker_name", "Unknown Speaker")
+            text = sentence.get("text", sentence.get("raw_text", ""))
+            if text.strip():
+                lines.append(f"{speaker}: {text}")
+        return "\n".join(lines)
+    return ""
+
+
+def identify_clients(transcript: Dict[str, Any], data_processor: DataProcessor) -> List[str]:
+    """Identify ALL clients from transcript by extracting external domains from participant emails."""
+    clients = []
+    
+    generic_providers = {
+        "gmail.com", "outlook.com", "yahoo.com", "hotmail.com", 
+        "icloud.com", "aol.com", "protonmail.com", "mail.com",
+        "live.com", "msn.com", "ymail.com"
+    }
+    
+    # Step 1: Try to extract client from title first
+    title = transcript.get("title", "")
+    if title and not title.lower().startswith("untitled"):
+        brand = data_processor._brand_from_title(title)
+        if brand:
+            brand_normalized = brand.strip().replace(" ", "").replace("-", "")
+            if brand_normalized:
+                clients.append(brand_normalized)
+    
+    # Step 2: Extract ALL external domains from participant emails
+    participants = transcript.get("participants", [])
+    meeting_attendees = transcript.get("meeting_attendees", [])
+    
+    all_emails = set()
+    if isinstance(participants, list):
+        for participant in participants:
+            if isinstance(participant, str):
+                all_emails.add(participant.lower())
+            elif isinstance(participant, dict):
+                email = participant.get("email", "")
+                if email:
+                    all_emails.add(email.lower())
+    
+    if meeting_attendees:
+        for attendee in meeting_attendees:
+            if isinstance(attendee, dict):
+                email = attendee.get("email", "")
+                if email:
+                    all_emails.add(email.lower())
+    
+    external_domains = set()
+    for email in all_emails:
+        if "@" in email:
+            domain = email.split("@")[1].lower()
+            if data_processor._is_internal_team(email):
+                continue
+            if domain in generic_providers:
+                continue
+            external_domains.add(domain)
+    
+    for domain in external_domains:
+        domain_parts = domain.split(".")
+        if domain_parts:
+            domain_name = domain_parts[0]
+            client_name = domain_name.title()
+            if client_name not in clients:
+                clients.append(client_name)
+    
+    return clients
+
+
+@app.post("/sync/daily")
+async def sync_daily():
+    """
+    Daily sync endpoint for n8n scheduled trigger.
+    
+    This endpoint:
+    1. Fetches last 1 day's transcripts from Fireflies
+    2. Processes and upserts them to Pinecone
+    3. Cleans data older than 1 year from Pinecone
+    
+    Returns:
+        JSON response with sync status and statistics
+    """
+    try:
+        logger.info("=" * 60)
+        logger.info("Starting daily sync")
+        logger.info("=" * 60)
+        
+        # Initialize services
+        fireflies_client = FirefliesClient()
+        pinecone_client = PineconeClient()
+        data_processor = DataProcessor()
+        
+        # Ensure index exists
+        if not pinecone_client.index:
+            if pinecone_client.index_name:
+                try:
+                    existing_indexes = pinecone_client.list_indexes()
+                    if pinecone_client.index_name not in existing_indexes:
+                        logger.info(f"Index '{pinecone_client.index_name}' does not exist. Creating...")
+                        pinecone_client.create_index()
+                    else:
+                        pinecone_client.index = pinecone_client.pc.Index(pinecone_client.index_name)
+                except Exception as e:
+                    logger.error(f"Error ensuring index exists: {e}")
+                    raise HTTPException(status_code=500, detail=f"Index error: {str(e)}")
+            else:
+                raise HTTPException(status_code=500, detail="PINECONE_INDEX_NAME not configured")
+        
+        # 1. Fetch last 1 day's transcripts
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=1)
+        from_date_str = start_date.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        to_date_str = end_date.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        
+        logger.info(f"Fetching transcripts from {start_date.date()} to {end_date.date()}")
+        transcript_list = await fireflies_client.get_transcripts_list_between(
+            from_date_str,
+            to_date_str,
+            limit=50
+        )
+        
+        transcripts_processed = 0
+        chunks_created = 0
+        
+        if transcript_list:
+            logger.info(f"Found {len(transcript_list)} transcripts to process")
+            
+            # Fetch full transcript details
+            full_transcripts = []
+            for transcript_info in transcript_list:
+                transcript_id = transcript_info.get("id")
+                if transcript_id:
+                    try:
+                        full_transcript = await fireflies_client.get_transcript_details(transcript_id)
+                        full_transcript.update(transcript_info)
+                        full_transcripts.append(full_transcript)
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch transcript {transcript_id}: {e}")
+                        full_transcripts.append(transcript_info)
+            
+            # Process and store transcripts
+            all_records = []
+            
+            for transcript in full_transcripts:
+                transcript_id = transcript.get("id")
+                if not transcript_id:
+                    continue
+                
+                # Extract text (with cleaning)
+                transcript_text = extract_transcript_text(transcript, clean=True)
+                if not transcript_text.strip():
+                    logger.warning(f"Skipping transcript {transcript_id}: No text content")
+                    continue
+                
+                # Chunk the text
+                chunk_size = 2500
+                overlap = 200
+                chunks = chunk_text(transcript_text, chunk_size=chunk_size, overlap=overlap)
+                logger.info(f"  Transcript {transcript_id}: {len(chunks)} chunks")
+                
+                # Identify clients
+                clients = identify_clients(transcript, data_processor)
+                if clients:
+                    logger.info(f"  Identified clients: {', '.join(clients)}")
+                
+                # Extract date and create numeric timestamp for filtering
+                date_str = transcript.get("dateString") or transcript.get("date", "")
+                date_timestamp = None  # Unix timestamp for numeric filtering
+                
+                if isinstance(date_str, str) and "T" in date_str:
+                    # Extract date part only (YYYY-MM-DD)
+                    date_str = date_str.split("T")[0]
+                    # Create timestamp for numeric filtering (Pinecone requires numbers for $lt/$gt)
+                    try:
+                        from datetime import datetime as dt
+                        date_obj = dt.strptime(date_str, "%Y-%m-%d")
+                        date_timestamp = int(date_obj.timestamp())
+                    except Exception as e:
+                        logger.warning(f"Failed to parse date {date_str}: {e}")
+                elif date_str:
+                    # Try to parse if it's already in YYYY-MM-DD format
+                    try:
+                        from datetime import datetime as dt
+                        date_obj = dt.strptime(date_str, "%Y-%m-%d")
+                        date_timestamp = int(date_obj.timestamp())
+                    except:
+                        pass
+                
+                # Get title and participants
+                title = transcript.get("title", "Untitled Meeting")
+                participants = transcript.get("participants", [])
+                if not participants and transcript.get("meeting_attendees"):
+                    participants = [
+                        attendee.get("email") 
+                        for attendee in transcript.get("meeting_attendees", [])
+                        if attendee.get("email")
+                    ]
+                
+                # Create records for each chunk
+                for i, chunk_text_content in enumerate(chunks):
+                    record_id = f"meeting_{transcript_id}#chunk_{i}"
+                    
+                    record = {
+                        "id": record_id,
+                        "text": chunk_text_content,
+                        "metadata": {
+                            "meeting_id": transcript_id,
+                            "date": date_str,
+                            "date_timestamp": date_timestamp,
+                            "client": clients,
+                            "title": title,
+                            "participants": participants,
+                            "chunk_index": i,
+                            "total_chunks": len(chunks),
+                            "content": chunk_text_content,
+                            "chunk_text": chunk_text_content[:200]
+                        }
+                    }
+                    all_records.append(record)
+                    chunks_created += 1
+            
+            # Upsert records in batches
+            if all_records:
+                logger.info(f"Upserting {len(all_records)} records to Pinecone...")
+                batch_size = 50
+                
+                for i in range(0, len(all_records), batch_size):
+                    batch = all_records[i:i + batch_size]
+                    try:
+                        pinecone_client.upsert_texts(batch)
+                        logger.info(f"  ✓ Upserted batch {i//batch_size + 1} ({len(batch)} records)")
+                    except Exception as e:
+                        logger.error(f"  ✗ Failed to upsert batch {i//batch_size + 1}: {e}")
+                
+                transcripts_processed = len(full_transcripts)
+                logger.info(f"✓ Successfully stored {chunks_created} chunks from {transcripts_processed} transcripts")
+        else:
+            logger.info("No new transcripts found for the past day")
+        
+        # 3. Clean old data (1 year back) - DISABLED TO PREVENT ACCIDENTAL DELETION
+        # TODO: Re-enable with proper date range configuration if needed
+        # logger.info("\nCleaning old data (older than 1 year)...")
+        # cutoff_date = end_date - timedelta(days=365)
+        # cutoff_timestamp = int(cutoff_date.timestamp())
+        # 
+        # try:
+        #     # Delete vectors with date_timestamp less than cutoff
+        #     # Pinecone filter format for numeric comparison
+        #     filter_dict = {
+        #         "date_timestamp": {"$lt": cutoff_timestamp}
+        #     }
+        #     pinecone_client.delete_by_filter(filter_dict)
+        #     logger.info(f"✓ Cleaned data older than {cutoff_date.date()}")
+        # except Exception as e:
+        #     logger.warning(f"Failed to clean old data: {e}")
+        #     # Don't fail the whole sync if cleanup fails
+        
+        cutoff_date = end_date - timedelta(days=365)  # Keep for response
+        
+        logger.info("=" * 60)
+        logger.info("Daily sync completed")
+        logger.info("=" * 60)
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "message": "Daily sync completed",
+                "transcripts_processed": transcripts_processed,
+                "chunks_created": chunks_created,
+                "date_range": {
+                    "from": from_date_str,
+                    "to": to_date_str
+                },
+                "cleanup_cutoff": cutoff_date.isoformat()
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in daily sync: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Daily sync error: {str(e)}")
