@@ -402,7 +402,7 @@ async def agent_query_stream(req: AgentQueryRequest):
             logger.info(f"Streaming query to agent (session: {session_id}): {req.question[:100]}...")
             full_response = ""
             
-            async for chunk in agent_service.astream_query(req.question, session_id=session_id):
+            async for chunk in agent_service.astream_query(req.question, session_id=session_id, conversation_id=req.conversation_id):
                 full_response += chunk
                 yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
             

@@ -486,10 +486,13 @@ IMPORTANT:
 
         # Load conversation history from Supabase and add to context
         conversation_history = ""
+        logger.info(f"Loading conversation history - conversation_id: {conversation_id}, client configured: {self.supabase_client.is_configured() if self.supabase_client else False}")
+
         if conversation_id and self.supabase_client.is_configured():
             try:
                 # Get only the last 10 messages to prevent context overflow (optimized)
                 messages = self.supabase_client.get_messages(conversation_id, limit=10)
+                logger.info(f"Loaded {len(messages)} messages for conversation {conversation_id}")
 
                 # Format as conversation history
                 history_parts = []
@@ -501,8 +504,13 @@ IMPORTANT:
 
                 if history_parts:
                     conversation_history = "\n\nPrevious conversation:\n" + "\n".join(history_parts) + "\n\n"
+                    logger.info(f"Added conversation history with {len(history_parts)} messages")
+                else:
+                    logger.info("No conversation history to add")
             except Exception as e:
                 logger.warning(f"Failed to load conversation history: {e}")
+        else:
+            logger.info("Skipping conversation history load - missing conversation_id or Supabase client not configured")
 
         # Combine history with current question
         full_question = conversation_history + "Current question: " + question
