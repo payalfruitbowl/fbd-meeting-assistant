@@ -9,4 +9,8 @@ groq
 pinecone==5.4.2
 fastembed
 sqlalchemy
+psycopg2
+supabase
+python-jose[cryptography]
+passlib[bcrypt]
 

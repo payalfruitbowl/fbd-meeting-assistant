@@ -1,14 +1,16 @@
 """
 Main FastAPI application entry point.
-Combines both Fireflies transcript processor and TeleCMI call analysis.
+Fireflies transcript processor and AI chat assistant.
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from starlette.responses import StreamingResponse
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 import logging
+import json
 from pydantic import BaseModel, Field
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Any
 
 # Import Fireflies services
 from app.config import settings
@@ -16,9 +18,8 @@ from app.services.fireflies_client import FirefliesClient
 from app.services.data_processor import DataProcessor
 from app.services.word_generator import WordGenerator
 from app.services.session_manager import SessionManager
-
-# Import TeleCMI routes
-from app_telecmi.routes import webhooks, analysis, dashboard
+from app.services.supabase_client import SupabaseClient
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # Configure logging
 logging.basicConfig(
@@ -29,9 +30,9 @@ logger = logging.getLogger(__name__)
 
 # Create main app
 app = FastAPI(
-    title="Fruitbowl Automation Platform",
-    description="Unified API for Fireflies transcript processing and TeleCMI call analysis",
-    version="2.0.0"
+    title="Fruitbowl Assistant",
+    description="AI chat assistant with Fireflies transcript processing",
+    version="1.0.0"
 )
 
 # CORS middleware
@@ -44,7 +45,14 @@ app.add_middleware(
 )
 
 # Initialize session manager (singleton)
+# No longer needs SQLite database - chat history handled by Supabase
 session_manager = SessionManager()
+
+# Initialize Supabase client (singleton)
+supabase_client = SupabaseClient()
+
+# Security scheme for JWT tokens
+security = HTTPBearer()
 
 # Fireflies Pydantic models
 class ClientTranscriptsRequest(BaseModel):
@@ -64,6 +72,7 @@ class ClientTranscriptsResponse(BaseModel):
 class AgentQueryRequest(BaseModel):
     question: str = Field(..., description="User question to ask the agent")
     session_id: Optional[str] = Field(None, description="Session ID for conversation continuity. If not provided, a new session will be created.")
+    conversation_id: Optional[str] = Field(None, description="Supabase conversation ID to save messages to. If provided, messages will be saved to chat history.")
 
 class AgentQueryResponse(BaseModel):
     status: str
@@ -76,16 +85,60 @@ class SessionCreateResponse(BaseModel):
     session_id: str
     message: str
 
-# Include TeleCMI routes
-app.include_router(webhooks.router)
-app.include_router(analysis.router)
-app.include_router(dashboard.router)
 
-# Fireflies routes (from existing app/main.py)
+# Authentication models
+class SignUpRequest(BaseModel):
+    email: str = Field(..., description="User email")
+    password: str = Field(..., min_length=6, description="User password (min 6 characters)")
+
+
+class SignInRequest(BaseModel):
+    email: str = Field(..., description="User email")
+    password: str = Field(..., description="User password")
+
+
+class AuthResponse(BaseModel):
+    status: str
+    user: Optional[Dict[str, Any]] = None
+    session: Optional[Dict[str, Any]] = None
+    message: Optional[str] = None
+
+
+# Conversation models
+class ConversationResponse(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    created_at: str
+    updated_at: str
+
+
+class CreateConversationRequest(BaseModel):
+    title: Optional[str] = Field(None, description="Conversation title")
+
+
+class MessageResponse(BaseModel):
+    id: str
+    conversation_id: str
+    role: str
+    content: str
+    created_at: str
+
+
+class AddMessageRequest(BaseModel):
+    conversation_id: str = Field(..., description="Conversation ID")
+    role: str = Field(..., description="Message role: 'user' or 'assistant'")
+    content: str = Field(..., description="Message content")
+
+
+class UpdateConversationTitleRequest(BaseModel):
+    title: str = Field(..., description="New conversation title")
+
+# Fireflies routes
 @app.get("/")
 async def root():
     """Root endpoint."""
-    return {"status": "ok", "message": "Fruitbowl Automation Platform"}
+    return {"status": "ok", "message": "Fruitbowl Assistant API"}
 
 @app.get("/health")
 async def health_check():
@@ -248,6 +301,88 @@ async def process_transcripts_client(req: ClientTranscriptsRequest):
         logger.error(f"Error in process-transcripts-client: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
+@app.post("/agent/query/stream")
+async def agent_query_stream(req: AgentQueryRequest):
+    """
+    Stream query the agent with a question (Server-Sent Events).
+
+    This endpoint:
+    - Creates a new session if session_id is not provided
+    - Uses existing session if session_id is provided (maintains conversation history)
+    - Streams response chunks as they are generated
+    - Automatically ensures metadata filters are registered before querying
+
+    Args:
+        req: AgentQueryRequest with question and optional session_id
+
+    Returns:
+        StreamingResponse with SSE format:
+        - data: {"type": "session", "session_id": "..."}
+        - data: {"type": "chunk", "content": "..."}
+        - data: {"type": "done", "response": "...", "session_id": "..."}
+    """
+    async def generate():
+        try:
+            # Get or create session
+            if req.session_id:
+                # Use existing session
+                if not session_manager.session_exists(req.session_id):
+                    logger.warning(f"Session not found: {req.session_id}, creating new session")
+                    session_id = session_manager.create_session()
+                else:
+                    session_id = req.session_id
+            else:
+                # Create new session
+                session_id = session_manager.create_session()
+
+            # Get agent service for this session
+            agent_service = session_manager.get_session(session_id)
+            if not agent_service:
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Failed to get agent service for session'})}\n\n"
+                return
+
+            # Send session ID first
+            yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
+
+            # Note: User message will be saved AFTER processing to avoid confusion in history loading
+
+            # Query the agent with streaming (this ensures metadata is registered)
+            logger.info(f"Streaming query to agent (session: {session_id}): {req.question[:100]}...")
+            full_response = ""
+
+            async for chunk in agent_service.astream_query(req.question, session_id=session_id, conversation_id=req.conversation_id):
+                full_response += chunk
+                yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+
+            # Save both user message and assistant response to Supabase
+            if req.conversation_id and supabase_client.is_configured():
+                try:
+                    # Save user message and assistant response
+                    supabase_client.add_message(req.conversation_id, "user", req.question)
+                    supabase_client.add_message(req.conversation_id, "assistant", full_response)
+                    logger.info(f"Saved conversation messages to {req.conversation_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to save messages to Supabase: {e}")
+                    # Don't fail the request if saving fails
+
+            # Send completion message
+            yield f"data: {json.dumps({'type': 'done', 'response': full_response, 'session_id': session_id})}\n\n"
+
+        except Exception as e:
+            logger.error(f"Error in streaming agent query: {str(e)}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
+
+
 @app.post("/agent/query", response_model=AgentQueryResponse)
 async def agent_query(req: AgentQueryRequest):
     """Query the agent with a question."""
@@ -322,6 +457,364 @@ async def get_sessions_count():
     except Exception as e:
         logger.error(f"Error getting sessions count: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting sessions count: {str(e)}")
+
+
+# Helper functions for authentication
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
+    """
+    Get current user from JWT token.
+
+    Args:
+        credentials: HTTP Bearer token credentials
+
+    Returns:
+        User data
+
+    Raises:
+        HTTPException: If token is invalid or user not found
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Authentication service not configured")
+
+    token = credentials.credentials
+    user = supabase_client.verify_token(token)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    return user
+
+
+# ============================================================================
+# Authentication Endpoints
+# ============================================================================
+
+@app.post("/auth/signup", response_model=AuthResponse)
+async def sign_up(request: SignUpRequest):
+    """
+    Sign up a new user.
+
+    Args:
+        request: Sign up request with email and password
+
+    Returns:
+        User data and session token
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Authentication service not configured")
+
+    try:
+        result = supabase_client.sign_up(request.email, request.password)
+        return AuthResponse(
+            status="success",
+            user=result.get("user"),
+            session=result.get("session"),
+            message="User created successfully"
+        )
+    except Exception as e:
+        logger.error(f"Sign up error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/auth/signin", response_model=AuthResponse)
+async def sign_in(request: SignInRequest):
+    """
+    Sign in a user.
+
+    Args:
+        request: Sign in request with email and password
+
+    Returns:
+        User data and session token
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Authentication service not configured")
+
+    try:
+        result = supabase_client.sign_in(request.email, request.password)
+        return AuthResponse(
+            status="success",
+            user=result.get("user"),
+            session=result.get("session"),
+            message="Signed in successfully"
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Sign in error: {error_msg}", exc_info=True)
+        # Provide more specific error message
+        if "Invalid login credentials" in error_msg or "Email not confirmed" in error_msg:
+            raise HTTPException(status_code=401, detail=error_msg)
+        raise HTTPException(status_code=401, detail=f"Sign in failed: {error_msg}")
+
+
+@app.get("/auth/me")
+async def get_current_user_info(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Get current user information.
+
+    Args:
+        current_user: Current user (from token)
+
+    Returns:
+        User data
+    """
+    return {
+        "status": "success",
+        "user": current_user
+    }
+
+
+# ============================================================================
+# Conversation Endpoints
+# ============================================================================
+
+@app.post("/conversations", response_model=ConversationResponse)
+async def create_conversation(
+    request: CreateConversationRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Create a new conversation.
+
+    Args:
+        request: Conversation creation request
+        current_user: Current user (from token)
+
+    Returns:
+        Created conversation
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Database service not configured")
+
+    try:
+        user_id = current_user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Invalid user data")
+
+        conversation = supabase_client.create_conversation(user_id, request.title)
+        return ConversationResponse(**conversation)
+    except Exception as e:
+        logger.error(f"Error creating conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/conversations", response_model=List[ConversationResponse])
+async def get_conversations(
+    limit: int = 50,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Get all conversations for the current user.
+
+    Args:
+        limit: Maximum number of conversations to return
+        current_user: Current user (from token)
+
+    Returns:
+        List of conversations
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Database service not configured")
+
+    try:
+        user_id = current_user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Invalid user data")
+
+        conversations = supabase_client.get_conversations(user_id, limit)
+        return [ConversationResponse(**conv) for conv in conversations]
+    except Exception as e:
+        logger.error(f"Error getting conversations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/conversations/{conversation_id}", response_model=ConversationResponse)
+async def get_conversation(
+    conversation_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Get a specific conversation by ID.
+
+    Args:
+        conversation_id: Conversation ID
+        current_user: Current user (from token)
+
+    Returns:
+        Conversation data
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Database service not configured")
+
+    try:
+        user_id = current_user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Invalid user data")
+
+        conversation = supabase_client.get_conversation(conversation_id, user_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        return ConversationResponse(**conversation)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/conversations/{conversation_id}")
+async def update_conversation_title(
+    conversation_id: str,
+    request: UpdateConversationTitleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Update conversation title.
+
+    Args:
+        conversation_id: Conversation ID
+        request: Update request with new title
+        current_user: Current user (from token)
+
+    Returns:
+        Updated conversation
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Database service not configured")
+
+    try:
+        user_id = current_user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Invalid user data")
+
+        conversation = supabase_client.update_conversation_title(conversation_id, user_id, request.title)
+        return ConversationResponse(**conversation)
+    except Exception as e:
+        logger.error(f"Error updating conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Delete a conversation and all its messages.
+
+    Args:
+        conversation_id: Conversation ID
+        current_user: Current user (from token)
+
+    Returns:
+        Success status
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Database service not configured")
+
+    try:
+        user_id = current_user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Invalid user data")
+
+        deleted = supabase_client.delete_conversation(conversation_id, user_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        return {"status": "success", "message": "Conversation deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Message Endpoints
+# ============================================================================
+
+@app.post("/messages", response_model=MessageResponse)
+async def add_message(
+    request: AddMessageRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Add a message to a conversation.
+
+    Args:
+        request: Message creation request
+        current_user: Current user (from token)
+
+    Returns:
+        Created message
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Database service not configured")
+
+    try:
+        user_id = current_user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Invalid user data")
+
+        # Verify user owns the conversation
+        conversation = supabase_client.get_conversation(request.conversation_id, user_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        if request.role not in ["user", "assistant"]:
+            raise HTTPException(status_code=400, detail="Role must be 'user' or 'assistant'")
+
+        message = supabase_client.add_message(
+            request.conversation_id,
+            request.role,
+            request.content
+        )
+        return MessageResponse(**message)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/conversations/{conversation_id}/messages", response_model=List[MessageResponse])
+async def get_messages(
+    conversation_id: str,
+    limit: int = 100,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Get all messages for a conversation.
+
+    Args:
+        conversation_id: Conversation ID
+        limit: Maximum number of messages to return
+        current_user: Current user (from token)
+
+    Returns:
+        List of messages
+    """
+    if not supabase_client.is_configured():
+        raise HTTPException(status_code=503, detail="Database service not configured")
+
+    try:
+        user_id = current_user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Invalid user data")
+
+        # Verify user owns the conversation
+        conversation = supabase_client.get_conversation(conversation_id, user_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        messages = supabase_client.get_messages(conversation_id, limit)
+        return [MessageResponse(**msg) for msg in messages]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting messages: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

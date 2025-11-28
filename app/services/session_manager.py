@@ -4,15 +4,12 @@ Session management service for agent conversations.
 Manages session lifecycle:
 - Create new sessions
 - Track active sessions
-- Clean up sessions and conversation history
+- Clean up sessions (conversation history handled by Supabase)
 """
 import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Set
-from pathlib import Path
-import os
-import sqlite3
 
 from app.services.agno_agent import AgnoAgentService
 
@@ -30,21 +27,12 @@ class SessionManager:
     - Last activity timestamp
     """
     
-    def __init__(self, db_file: str = "tmp/agents.db"):
+    def __init__(self):
         """
         Initialize session manager.
-        
-        Args:
-            db_file: Path to SQLite database file for chat history
+        Chat history is now handled by Supabase, so no SQLite database needed.
         """
-        self.db_file = db_file
         self.sessions: Dict[str, Dict] = {}  # session_id -> session_data
-        self._ensure_db_directory()
-    
-    def _ensure_db_directory(self):
-        """Ensure the database directory exists."""
-        db_path = Path(self.db_file)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
     
     def create_session(self) -> str:
         """
@@ -107,86 +95,25 @@ class SessionManager:
     
     def delete_session(self, session_id: str) -> bool:
         """
-        Delete a session and clean up its conversation history.
-        
+        Delete a session.
+        Note: Conversation history is now handled by Supabase and cleaned up via API calls.
+
         Args:
             session_id: Session ID to delete
-            
+
         Returns:
             True if session was deleted, False if session didn't exist
         """
         if session_id not in self.sessions:
             logger.info(f"Session {session_id} not found (may have been already deleted)")
             return False
-        
-        # Clean up conversation history from database
-        try:
-            self._cleanup_session_history(session_id)
-        except Exception as e:
-            logger.error(f"Error cleaning up session history for {session_id}: {e}")
-        
+
         # Remove session from memory
+        # Conversation history cleanup is handled by Supabase via API calls
         del self.sessions[session_id]
         logger.info(f"Deleted session: {session_id}")
         return True
     
-    def _cleanup_session_history(self, session_id: str):
-        """
-        Delete conversation history for a session from the database.
-        
-        Args:
-            session_id: Session ID to clean up
-        """
-        if not os.path.exists(self.db_file):
-            logger.debug(f"Database file does not exist: {self.db_file}")
-            return
-        
-        try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.cursor()
-            
-            # Get all tables in the database
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [row[0] for row in cursor.fetchall()]
-            
-            total_deleted = 0
-            
-            for table in tables:
-                try:
-                    # Get column names for this table
-                    cursor.execute(f"PRAGMA table_info({table})")
-                    columns = [row[1] for row in cursor.fetchall()]
-                    
-                    # Check if table has session_id column (case-insensitive)
-                    session_id_column = None
-                    for col in columns:
-                        if col.lower() in ['session_id', 'sessionid', 'session']:
-                            session_id_column = col
-                            break
-                    
-                    if session_id_column:
-                        # Delete rows for this session
-                        cursor.execute(f"DELETE FROM {table} WHERE {session_id_column} = ?", (session_id,))
-                        deleted = cursor.rowcount
-                        if deleted > 0:
-                            logger.info(f"Deleted {deleted} records from {table} for session {session_id}")
-                            total_deleted += deleted
-                    
-                except sqlite3.Error as e:
-                    logger.debug(f"Error processing table {table}: {e}")
-                    continue
-            
-            conn.commit()
-            conn.close()
-            
-            if total_deleted > 0:
-                logger.info(f"Cleaned up {total_deleted} conversation history records for session: {session_id}")
-            else:
-                logger.debug(f"No conversation history found to clean up for session: {session_id}")
-            
-        except Exception as e:
-            logger.error(f"Error cleaning up session history: {e}")
-            # Don't raise - session deletion should still succeed even if cleanup fails
     
     def cleanup_inactive_sessions(self, max_age_minutes: int = 60):
         """

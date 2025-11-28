@@ -12,6 +12,7 @@ Note: This service only connects to existing indexes. Index management
 """
 import logging
 import os
+import asyncio
 from pathlib import Path
 from typing import Optional
 from agno.agent import Agent
@@ -19,9 +20,10 @@ from agno.knowledge.knowledge import Knowledge
 from agno.vectordb.pineconedb import PineconeDb
 from agno.knowledge.embedder.fastembed import FastEmbedEmbedder
 from agno.models.groq import Groq
-from agno.db.sqlite import SqliteDb
+# from agno.db.postgres import PostgresDb  # Removed - using Supabase REST API instead
 
 from app.config import settings
+from app.services.supabase_client import SupabaseClient
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,8 @@ class AgnoAgentService:
         top_p: float = 1,
         search_knowledge: bool = True,
         enable_chat_history: bool = True,
-        num_history_runs: int = 2  # Reduced from 5 to 2 - prevents context overflow while maintaining conversation continuity
+        num_history_runs: int = 3,  # Reduced from 5 to 3 - prevents context overflow while maintaining conversation continuity
+        conversation_id: Optional[str] = None  # For saving messages to Supabase
     ):
         """
         Initialize Agno agent with Pinecone knowledge base.
@@ -68,7 +71,11 @@ class AgnoAgentService:
         
         self.index_name = name
         self.agent_name = agent_name
-        
+        self.conversation_id = conversation_id
+
+        # Initialize Supabase client for manual message saving
+        self.supabase_client = SupabaseClient()
+
         # Initialize FastEmbed embedder
         self.embedder = FastEmbedEmbedder()
         
@@ -92,16 +99,15 @@ class AgnoAgentService:
         
         # Metadata registration flag - will be registered lazily on first async query
         self._metadata_registered = False
+        self._metadata_registration_task = None
         
         # Initialize database for chat history (session-level persistence)
+        # Note: Using Supabase REST API for chat history instead of direct database connection
+        # This is more reliable and follows Supabase best practices
         db = None
         if enable_chat_history:
-            # Create tmp directory if it doesn't exist
-            tmp_dir = Path("tmp")
-            tmp_dir.mkdir(exist_ok=True)
-            db_file = tmp_dir / "agents.db"
-            db = SqliteDb(db_file=str(db_file))
-            logger.info(f"Chat history enabled with database: {db_file}")
+            logger.info("Chat history enabled via Supabase REST API (recommended approach)")
+            # Chat history will be saved manually via Supabase API calls
         
         # Initialize Groq model (same pattern as llm_client_identifier.py)
         groq_model = Groq(
@@ -112,15 +118,16 @@ class AgnoAgentService:
         )
         
         # Create agent with knowledge base and Groq model
+        # Note: No database for chat history - using Supabase REST API instead
         self.agent = Agent(
             name=self.agent_name,
             model=groq_model,
             knowledge=self.knowledge,
             search_knowledge=search_knowledge,
             enable_agentic_knowledge_filters=True,  # Agent automatically extracts metadata filters from queries
-            db=db,  # Database for session history
-            add_history_to_context=enable_chat_history,  # Automatically add previous conversation to context
-            num_history_runs=num_history_runs if enable_chat_history else 0,  # Number of previous messages to include
+            db=None,  # No database - chat history handled via Supabase REST API
+            add_history_to_context=False,  # Manual history management
+            num_history_runs=0,  # No automatic history
             store_tool_messages=False,  # Don't store tool messages (knowledge search tools) to prevent context bloat
             markdown=True,
             debug_mode=settings.DEBUG,
@@ -361,10 +368,23 @@ IMPORTANT:
         """
         if self._metadata_registered:
             return
-        
+
+        # Avoid duplicate registration attempts
+        if self._metadata_registration_task and not self._metadata_registration_task.done():
+            await self._metadata_registration_task
+            return
+
+        # Start metadata registration as a background task
+        self._metadata_registration_task = asyncio.create_task(self._register_metadata())
+        await self._metadata_registration_task
+
+    async def _register_metadata(self):
+        """
+        Register metadata filters with Pinecone (async background task).
+        """
         # Our required metadata fields
         required_fields = {"client", "date", "date_timestamp", "title", "meeting_id", "participants"}
-        
+
         try:
             # Check if OUR specific metadata fields are already registered
             valid_keys = self.knowledge.get_filters() if hasattr(self.knowledge, 'get_filters') else None
@@ -372,7 +392,7 @@ IMPORTANT:
                 # Check if all our required fields are present
                 valid_keys_set = set(valid_keys) if isinstance(valid_keys, (list, set)) else set()
                 missing_fields = required_fields - valid_keys_set
-                
+
                 if not missing_fields:
                     logger.info(f"All required metadata filters already registered: {sorted(required_fields)}")
                     self._metadata_registered = True
@@ -383,7 +403,7 @@ IMPORTANT:
                 logger.info("No metadata filters registered yet")
         except Exception as e:
             logger.debug(f"Could not check existing filters: {e}")
-        
+
         try:
             # Register metadata filter keys by adding a dummy record
             # This is required because Agno only discovers metadata fields through add_content()
@@ -417,7 +437,7 @@ IMPORTANT:
                 )
                 logger.info(f"Registered metadata filter keys via dummy record: {sorted(required_fields)} (date: 2000-01-01, won't interfere)")
                 self._metadata_registered = True
-            
+
             # Verify registration
             try:
                 valid_keys = self.knowledge.get_filters() if hasattr(self.knowledge, 'get_filters') else None
@@ -430,7 +450,7 @@ IMPORTANT:
                         logger.warning(f"⚠ Registration may have failed - our fields not found in: {valid_keys}")
             except:
                 pass
-                
+
         except Exception as e:
             logger.warning(f"Failed to register metadata via dummy record: {e}")
             # Check if filters were registered anyway
@@ -445,27 +465,63 @@ IMPORTANT:
             except:
                 pass
     
-    async def astream_query(self, question: str, session_id: Optional[str] = "default"):
+    async def astream_query(self, question: str, session_id: Optional[str] = "default", conversation_id: Optional[str] = None):
         """
         Async streaming query the agent with a question.
         Yields chunks of the response as they are generated.
-        
+
         Args:
             question: User question/query
             session_id: Session ID for maintaining conversation history (default: "default")
-            
+            conversation_id: Supabase conversation ID for saving messages
+
         Yields:
             Chunks of agent response as strings
         """
+        # Store conversation_id for message saving
+        self.conversation_id = conversation_id
+
+        # Start metadata registration in background (non-blocking)
+        metadata_task = asyncio.create_task(self._ensure_metadata_registered())
+
+        # Load conversation history from Supabase and add to context
+        conversation_history = ""
+        if conversation_id and self.supabase_client.is_configured():
+            try:
+                # Get only the last 10 messages to prevent context overflow (optimized)
+                messages = self.supabase_client.get_messages(conversation_id, limit=10)
+
+                # Format as conversation history
+                history_parts = []
+                for msg in messages:
+                    if msg['role'] == 'user':
+                        history_parts.append(f"User: {msg['content']}")
+                    elif msg['role'] == 'assistant':
+                        history_parts.append(f"Assistant: {msg['content']}")
+
+                if history_parts:
+                    conversation_history = "\n\nPrevious conversation:\n" + "\n".join(history_parts) + "\n\n"
+            except Exception as e:
+                logger.warning(f"Failed to load conversation history: {e}")
+
+        # Combine history with current question
+        full_question = conversation_history + "Current question: " + question
         try:
             # Ensure metadata is registered before first query
             await self._ensure_metadata_registered()
             
-            async for chunk in self.agent.arun(question, session_id=session_id, stream=True):
+            full_response = ""
+            async for chunk in self.agent.arun(full_question, session_id=session_id, stream=True):
                 if hasattr(chunk, 'content'):
+                    full_response += chunk.content
                     yield chunk.content
                 else:
-                    yield str(chunk)
+                    chunk_str = str(chunk)
+                    full_response += chunk_str
+                    yield chunk_str
+
+            # Assistant response is saved in main.py after streaming completes
+            # No need to save here to avoid duplicates
         except Exception as e:
             logger.error(f"Error in async streaming query: {e}")
             raise

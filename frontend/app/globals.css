@@ -29,6 +29,7 @@ body {
   --text-primary: #ffffff;
   --text-secondary: #b3b3b3;
   --text-tertiary: #808080;
+  --text-error: #ff6b6b;
   --border-color: #3a3a3a;
   --accent-color: #ffffff;
   --accent-hover: #e0e0e0;
@@ -49,6 +50,7 @@ body {
   --text-primary: #1f1f1f;
   --text-secondary: #4a4a4a;
   --text-tertiary: #808080;
+  --text-error: #dc3545;
   --border-color: #e0e0e0;
   --accent-color: #1f1f1f;
   --accent-hover: #2a2a2a;

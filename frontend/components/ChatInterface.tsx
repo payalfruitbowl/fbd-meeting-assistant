@@ -3,7 +3,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { queryAgentStream, deleteSession, type Message } from './api'
+import { queryAgentStream, deleteSession, type Message, getConversationMessages, createConversation, updateConversationTitle, getConversation } from './api'
+import Sidebar from './Sidebar'
 
 export default function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>([])
@@ -12,6 +13,10 @@ export default function ChatInterface() {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [isHomePage, setIsHomePage] = useState(true)
   const [theme, setTheme] = useState<'dark' | 'light'>('dark')
+  const [currentConversationId, setCurrentConversationId] = useState<string | undefined>(undefined)
+  const [conversationTitle, setConversationTitle] = useState<string>('New Chat')
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false)
+  const [sidebarRefreshTrigger, setSidebarRefreshTrigger] = useState<number>(0)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const homeInputRef = useRef<HTMLInputElement>(null)
   const chatInputRef = useRef<HTMLTextAreaElement>(null)
@@ -74,13 +79,44 @@ export default function ChatInterface() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    
+
     if (!input.trim() || isLoading) return
 
     const userMessage: Message = {
       role: 'user',
       content: input.trim(),
       timestamp: new Date(),
+    }
+
+    // Create conversation if this is a new chat (no existing conversation)
+    let conversationId = currentConversationId
+    if (!conversationId) {
+      try {
+        const newConversation = await createConversation(conversationTitle)
+        conversationId = newConversation.id
+        setCurrentConversationId(conversationId)
+      } catch (error) {
+        console.error('Failed to create conversation:', error)
+        // Continue without conversation ID for now
+      }
+    }
+
+    // Update conversation title if this is the first user message
+    if (conversationId && messages.length === 0 && conversationTitle === 'New Chat') {
+      const truncatedTitle = input.trim().length > 50
+        ? input.trim().substring(0, 50) + '...'
+        : input.trim()
+
+      // Update title asynchronously (don't block the chat)
+      updateConversationTitle(conversationId, truncatedTitle)
+        .then(() => {
+          setConversationTitle(truncatedTitle)
+          setSidebarRefreshTrigger(prev => prev + 1) // Trigger sidebar refresh
+        })
+        .catch((error) => {
+          console.error('Failed to update conversation title:', error)
+          // Don't show error to user, just keep the default title
+        })
     }
 
     // Transition from home page to chat interface
@@ -140,7 +176,8 @@ export default function ChatInterface() {
           })
           setIsLoading(false)
           focusInput()
-        }
+        },
+        conversationId // Pass conversation ID to save messages
       )
     } catch (error) {
       setMessages((prev) => {
@@ -167,199 +204,267 @@ export default function ChatInterface() {
     }
   }
 
-  if (isHomePage) {
-    return (
-      <div style={{
-        display: 'flex',
-        flexDirection: 'column',
-        minHeight: '100vh',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: '40px 20px',
-        position: 'relative',
-      }}>
-        {/* Theme Toggle */}
-        <button
-          onClick={toggleTheme}
-          style={{
-            position: 'absolute',
-            top: '24px',
-            right: '24px',
-            padding: '8px 16px',
-            backgroundColor: 'var(--bg-secondary)',
-            border: '1px solid var(--border-color)',
-            borderRadius: '8px',
-            color: 'var(--text-primary)',
-            fontSize: '14px',
-            cursor: 'pointer',
-            transition: 'all 0.2s ease',
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.backgroundColor = 'var(--bg-tertiary)'
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.backgroundColor = 'var(--bg-secondary)'
-          }}
-        >
-          {theme === 'dark' ? '☀️ Light' : '🌙 Dark'}
-        </button>
+  // Handle conversation selection from sidebar
+  const handleConversationSelect = async (conversationId: string) => {
+    try {
+      setIsLoading(true)
+      setCurrentConversationId(conversationId)
 
-        {/* Centered Content */}
-        <div className="home-content" style={{
-          width: '100%',
-          maxWidth: '80%',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: '32px',
-        }}>
-          <h1 style={{
-            fontSize: '32px',
-            fontWeight: '600',
-            color: 'var(--text-primary)',
-            margin: 0,
-            textAlign: 'center',
-            letterSpacing: '-0.5px',
-          }}>
-            Fruitbowl Assistant
-          </h1>
+      // Load conversation details and messages
+      const [conversation, conversationMessages] = await Promise.all([
+        getConversation(conversationId),
+        getConversationMessages(conversationId)
+      ])
 
-          <p style={{
-            fontSize: '16px',
-            color: 'var(--text-secondary)',
-            textAlign: 'center',
-            margin: 0,
-            lineHeight: '1.6',
-          }}>
-            Ask me about the Fruitbowl meetings and get detailed answers
-          </p>
+      // Convert conversation messages to chat messages
+      const chatMessages: Message[] = conversationMessages.map(msg => ({
+        role: msg.role as 'user' | 'assistant',
+        content: msg.content,
+        timestamp: new Date(msg.created_at),
+        id: msg.id,
+      }))
 
-          <form
-            onSubmit={handleSubmit}
-            style={{
-              width: '100%',
-              display: 'flex',
-              gap: '12px',
-              alignItems: 'center',
-            }}
-          >
-            <input
-              ref={homeInputRef}
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask about Fruitbowl meetings..."
-              disabled={isLoading}
-              style={{
-                flex: 1,
-                padding: '16px 20px',
-                backgroundColor: 'var(--input-bg)',
-                border: '1px solid var(--input-border)',
-                borderRadius: '12px',
-                fontSize: '16px',
-                fontFamily: 'inherit',
-                color: 'var(--text-primary)',
-                outline: 'none',
-                transition: 'all 0.2s ease',
-              }}
-              onFocus={(e) => {
-                e.target.style.borderColor = 'var(--input-focus)'
-                e.target.style.backgroundColor = 'var(--bg-tertiary)'
-              }}
-              onBlur={(e) => {
-                e.target.style.borderColor = 'var(--input-border)'
-                e.target.style.backgroundColor = 'var(--input-bg)'
-              }}
-            />
-            <button
-              type="submit"
-              disabled={!input.trim() || isLoading}
-              style={{
-                padding: '16px 32px',
-                backgroundColor: input.trim() && !isLoading ? 'var(--accent-color)' : 'var(--bg-tertiary)',
-              color: input.trim() && !isLoading 
-                ? (theme === 'dark' ? '#1f1f1f' : '#ffffff')
-                : 'var(--text-tertiary)',
-                border: 'none',
-                borderRadius: '12px',
-                fontSize: '16px',
-                fontWeight: '500',
-                cursor: input.trim() && !isLoading ? 'pointer' : 'not-allowed',
-                transition: 'all 0.2s ease',
-                whiteSpace: 'nowrap',
-              }}
-              onMouseEnter={(e) => {
-                if (input.trim() && !isLoading) {
-                  e.currentTarget.style.backgroundColor = 'var(--accent-hover)'
-                }
-              }}
-              onMouseLeave={(e) => {
-                if (input.trim() && !isLoading) {
-                  e.currentTarget.style.backgroundColor = 'var(--accent-color)'
-                }
-              }}
-            >
-              {isLoading ? '...' : 'Send'}
-            </button>
-          </form>
-        </div>
-      </div>
-    )
+      setMessages(chatMessages)
+      setIsHomePage(false)
+      setSessionId(null) // Clear session ID when switching conversations
+      setConversationTitle(conversation.title || 'Untitled Chat')
+
+    } catch (error) {
+      console.error('Failed to load conversation:', error)
+      alert('Failed to load conversation')
+    } finally {
+      setIsLoading(false)
+    }
   }
+
+  // Handle new chat creation
+  const handleNewChat = () => {
+    setMessages([])
+    setCurrentConversationId(undefined)
+    setConversationTitle('New Chat')
+    setIsHomePage(true)
+    setSessionId(null)
+  }
+
+  // Handle sidebar collapse toggle
+  const handleToggleSidebar = () => {
+    setSidebarCollapsed(prev => !prev)
+  }
+
 
   return (
     <div className="chat-container" style={{
       display: 'flex',
-      flexDirection: 'column',
       height: '100vh',
       width: '100%',
       margin: 0,
       padding: 0,
     }}>
-      {/* Header */}
-      <header style={{
-        padding: '12px 24px',
-        borderBottom: '1px solid var(--border-color)',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        backgroundColor: 'var(--bg-primary)',
-        position: 'sticky',
-        top: 0,
-        zIndex: 10,
-      }}>
-        <h1 style={{
-          fontSize: '18px',
-          fontWeight: '600',
-          color: 'var(--text-primary)',
-          margin: 0,
-        }}>
-          Fruitbowl Assistant
-        </h1>
-        <button
-          onClick={toggleTheme}
-          style={{
-            padding: '6px 12px',
-            backgroundColor: 'transparent',
-            border: '1px solid var(--border-color)',
-            borderRadius: '6px',
-            color: 'var(--text-primary)',
-            fontSize: '13px',
-            cursor: 'pointer',
-            transition: 'all 0.2s ease',
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.backgroundColor = 'var(--bg-secondary)'
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.backgroundColor = 'transparent'
-          }}
-        >
-          {theme === 'dark' ? '☀️' : '🌙'}
-        </button>
-      </header>
+      {/* Sidebar */}
+      <Sidebar
+        currentConversationId={currentConversationId}
+        onConversationSelect={handleConversationSelect}
+        onNewChat={handleNewChat}
+        isCollapsed={sidebarCollapsed}
+        onToggleCollapse={handleToggleSidebar}
+        refreshTrigger={sidebarRefreshTrigger}
+      />
 
-      {/* Messages */}
+      {/* Main Content Area */}
+      <div style={{
+        flex: 1,
+        marginLeft: sidebarCollapsed ? '60px' : '280px', // Account for sidebar width
+        display: 'flex',
+        flexDirection: 'column',
+        height: '100vh',
+        transition: 'margin-left 0.3s ease',
+      }}>
+        {isHomePage ? (
+          /* Home Page */
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: '100vh',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '40px 20px',
+            position: 'relative',
+            marginLeft: sidebarCollapsed ? '60px' : '280px',
+            transition: 'margin-left 0.3s ease',
+          }}>
+            {/* Theme Toggle */}
+            <button
+              onClick={toggleTheme}
+              style={{
+                position: 'absolute',
+                top: '24px',
+                right: '24px',
+                padding: '8px 16px',
+                backgroundColor: 'var(--bg-secondary)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '8px',
+                color: 'var(--text-primary)',
+                fontSize: '14px',
+                cursor: 'pointer',
+                transition: 'all 0.2s ease',
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.backgroundColor = 'var(--bg-tertiary)'
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.backgroundColor = 'var(--bg-secondary)'
+              }}
+            >
+              {theme === 'dark' ? '☀️ Light' : '🌙 Dark'}
+            </button>
+
+            {/* Centered Content */}
+            <div className="home-content" style={{
+              width: '100%',
+              maxWidth: '80%',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: '32px',
+            }}>
+              <h1 style={{
+                fontSize: '32px',
+                fontWeight: '600',
+                color: 'var(--text-primary)',
+                margin: 0,
+                textAlign: 'center',
+                letterSpacing: '-0.5px',
+              }}>
+                Fruitbowl Assistant
+              </h1>
+
+              <p style={{
+                fontSize: '16px',
+                color: 'var(--text-secondary)',
+                textAlign: 'center',
+                margin: 0,
+                lineHeight: '1.6',
+              }}>
+                Ask me about the Fruitbowl meetings and get detailed answers
+              </p>
+
+              <form
+                onSubmit={handleSubmit}
+                style={{
+                  width: '100%',
+                  display: 'flex',
+                  gap: '12px',
+                  alignItems: 'center',
+                }}
+              >
+                <input
+                  ref={homeInputRef}
+                  type="text"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  placeholder="Ask about Fruitbowl meetings..."
+                  disabled={isLoading}
+                  style={{
+                    flex: 1,
+                    padding: '16px 20px',
+                    backgroundColor: 'var(--input-bg)',
+                    border: '1px solid var(--input-border)',
+                    borderRadius: '12px',
+                    fontSize: '16px',
+                    fontFamily: 'inherit',
+                    color: 'var(--text-primary)',
+                    outline: 'none',
+                    transition: 'all 0.2s ease',
+                  }}
+                  onFocus={(e) => {
+                    e.target.style.borderColor = 'var(--input-focus)'
+                    e.target.style.backgroundColor = 'var(--bg-tertiary)'
+                  }}
+                  onBlur={(e) => {
+                    e.target.style.borderColor = 'var(--input-border)'
+                    e.target.style.backgroundColor = 'var(--input-bg)'
+                  }}
+                />
+                <button
+                  type="submit"
+                  disabled={!input.trim() || isLoading}
+                  style={{
+                    padding: '16px 32px',
+                    backgroundColor: input.trim() && !isLoading ? 'var(--accent-color)' : 'var(--bg-tertiary)',
+                  color: input.trim() && !isLoading
+                    ? (theme === 'dark' ? '#1f1f1f' : '#ffffff')
+                    : 'var(--text-tertiary)',
+                    border: 'none',
+                    borderRadius: '12px',
+                    fontSize: '16px',
+                    fontWeight: '500',
+                    cursor: input.trim() && !isLoading ? 'pointer' : 'not-allowed',
+                    transition: 'all 0.2s ease',
+                    whiteSpace: 'nowrap',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (input.trim() && !isLoading) {
+                      e.currentTarget.style.backgroundColor = 'var(--accent-hover)'
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (input.trim() && !isLoading) {
+                      e.currentTarget.style.backgroundColor = 'var(--accent-color)'
+                    }
+                  }}
+                >
+                  {isLoading ? '...' : 'Send'}
+                </button>
+              </form>
+            </div>
+          </div>
+        ) : (
+          /* Chat Interface */
+          <>
+            {/* Header */}
+            <header style={{
+              padding: '12px 24px',
+              borderBottom: '1px solid var(--border-color)',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              backgroundColor: 'var(--bg-primary)',
+              position: 'sticky',
+              top: 0,
+              zIndex: 10,
+            }}>
+              <h1 style={{
+                fontSize: '18px',
+                fontWeight: '600',
+                color: 'var(--text-primary)',
+                margin: 0,
+              }}>
+                {conversationTitle || 'Fruitbowl Assistant'}
+              </h1>
+              <button
+                onClick={toggleTheme}
+                style={{
+                  padding: '6px 12px',
+                  backgroundColor: 'transparent',
+                  border: '1px solid var(--border-color)',
+                  borderRadius: '6px',
+                  color: 'var(--text-primary)',
+                  fontSize: '13px',
+                  cursor: 'pointer',
+                  transition: 'all 0.2s ease',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = 'var(--bg-secondary)'
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = 'transparent'
+                }}
+              >
+                {theme === 'dark' ? '☀️' : '🌙'}
+              </button>
+            </header>
+
+            {/* Messages */}
       <div style={{
         flex: 1,
         overflowY: 'auto',
@@ -678,8 +783,11 @@ export default function ChatInterface() {
           >
             {isLoading ? '...' : '↑'}
           </button>
-        </div>
-      </form>
+            </div>
+          </form>
+          </>
+        )}
+      </div> {/* End Main Content Area */}
     </div>
   )
 }

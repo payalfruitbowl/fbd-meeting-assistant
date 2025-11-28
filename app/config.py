@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     # Comma-separated list of allowed origins (e.g., "http://localhost:3000,https://your-frontend.onrender.com")
     CORS_ALLOWED_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,https://fbd-meeting-assistant-frontend.onrender.com"
     
+    # Supabase Configuration
+    SUPABASE_URL: Optional[str] = None
+    SUPABASE_KEY: Optional[str] = None  # Service role key for backend operations
+    SUPABASE_JWT_SECRET: Optional[str] = None  # JWT secret for token verification
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
