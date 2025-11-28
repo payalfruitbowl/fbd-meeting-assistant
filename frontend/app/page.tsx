@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import ChatInterface from '../components/ChatInterface'
-import { isAuthenticated } from '@/lib/auth'
+import { isAuthenticated } from '../lib/auth'
 
 export default function Home() {
   const router = useRouter()

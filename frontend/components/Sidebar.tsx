@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { getConversations, Conversation, deleteConversation } from './api'
-import { signOut } from '@/lib/auth'
+import { signOut } from '../lib/auth'
 
 interface SidebarProps {
   currentConversationId?: string
