@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
-import { signIn, isAuthenticated } from '../../lib/auth'
+import { signIn, isAuthenticated } from '../../components/auth'
 import Link from 'next/link'
 
 export default function SignInPage() {

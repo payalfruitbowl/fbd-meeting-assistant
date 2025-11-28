@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
-import { signUp, isAuthenticated } from '../../lib/auth'
+import { signUp, isAuthenticated } from '../../components/auth'
 import Link from 'next/link'
 
 export default function SignUpPage() {
