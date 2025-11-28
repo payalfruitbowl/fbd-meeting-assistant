@@ -4,7 +4,7 @@ export interface Message {
   role: 'user' | 'assistant'
   content: string
   timestamp: Date
-  id?: number
+  id?: string | number
 }
 
 export interface AgentQueryRequest {
