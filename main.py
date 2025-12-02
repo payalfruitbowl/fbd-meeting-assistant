@@ -766,6 +766,42 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     return chunks
 
 
+def chunk_text_generator(text: str, chunk_size: int = 500, overlap: int = 50):
+    """
+    Generate chunks incrementally (yields one at a time).
+    This is memory-efficient - doesn't create all chunks at once.
+    
+    Args:
+        text: Text to chunk
+        chunk_size: Size of each chunk
+        overlap: Overlap between chunks
+        
+    Yields:
+        Chunk strings one at a time
+    """
+    if not text:
+        return
+
+    if len(text) <= chunk_size:
+        yield text
+        return
+
+    if overlap >= chunk_size:
+        overlap = chunk_size // 4
+
+    start = 0
+    step = chunk_size - overlap
+
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        if chunk.strip():
+            yield chunk
+        start += step
+        if start >= len(text):
+            break
+
+
 def extract_transcript_text(transcript: Dict[str, Any], clean: bool = True) -> str:
     """Extract formatted text from transcript sentences."""
     if clean:
@@ -959,69 +995,90 @@ async def run_daily_sync_background():
                 # Clear full_transcript from memory NOW - we have all the metadata we need
                 del full_transcript
 
-                # Chunk the text (this creates a list of strings - relatively lightweight)
+                # Estimate total chunks for metadata (approximate, but close enough)
                 chunk_size = 2500
                 overlap = 200
-                chunks = chunk_text(transcript_text, chunk_size=chunk_size, overlap=overlap)
-                total_chunks = len(chunks)
-                logger.info(f"  Transcript {transcript_id}: {total_chunks} chunks")
-
+                step = chunk_size - overlap
+                estimated_total_chunks = max(1, (len(transcript_text) + step - 1) // step)
+                
+                # Use generator to chunk text incrementally (CRITICAL: doesn't create all chunks at once)
+                # This processes chunks one at a time, keeping memory usage minimal
+                chunk_generator = chunk_text_generator(transcript_text, chunk_size=chunk_size, overlap=overlap)
+                
                 # Process chunks in small batches to minimize memory usage
                 # CRITICAL: Only process 10 chunks at a time, then upsert and clear
                 CHUNK_BATCH_SIZE = 10  # Process 10 chunks at a time
                 upsert_batch_size = 50  # Pinecone batch size for upserting
+                
+                batch_records = []
+                chunk_index = 0
+                total_chunks_processed = 0
+                
+                # Process chunks as they're generated (incremental, memory-efficient)
+                for chunk_text_content in chunk_generator:
+                    # Create record for this chunk
+                    record_id = f"meeting_{transcript_id}#chunk_{chunk_index}"
 
-                for chunk_batch_start in range(0, total_chunks, CHUNK_BATCH_SIZE):
-                    chunk_batch_end = min(chunk_batch_start + CHUNK_BATCH_SIZE, total_chunks)
-                    chunk_batch = chunks[chunk_batch_start:chunk_batch_end]
-                    
-                    # Create records for THIS batch of chunks only (not all chunks)
-                    batch_records = []
-                    for i, chunk_text_content in enumerate(chunk_batch):
-                        chunk_index = chunk_batch_start + i
-                        record_id = f"meeting_{transcript_id}#chunk_{chunk_index}"
-
-                        record = {
-                            "id": record_id,
-                            "text": chunk_text_content,
-                            "metadata": {
-                                "meeting_id": transcript_id,
-                                "date": date_str,
-                                "date_timestamp": date_timestamp,
-                                "client": clients,
-                                "title": title,
-                                "participants": participants,
-                                "chunk_index": chunk_index,
-                                "total_chunks": total_chunks,
-                                "content": chunk_text_content,
-                                "chunk_text": chunk_text_content[:200]
-                            }
+                    record = {
+                        "id": record_id,
+                        "text": chunk_text_content,
+                        "metadata": {
+                            "meeting_id": transcript_id,
+                            "date": date_str,
+                            "date_timestamp": date_timestamp,
+                            "client": clients,
+                            "title": title,
+                            "participants": participants,
+                            "chunk_index": chunk_index,
+                            "total_chunks": estimated_total_chunks,  # Estimated, will be close to actual
+                            "content": chunk_text_content,
+                            "chunk_text": chunk_text_content[:200]
                         }
-                        batch_records.append(record)
-                        chunks_created += 1
+                    }
+                    batch_records.append(record)
+                    chunks_created += 1
+                    chunk_index += 1
+                    total_chunks_processed += 1
 
-                    # Upsert THIS batch immediately (don't accumulate all chunks)
-                    if batch_records:
+                    # When batch reaches size, upsert and clear immediately
+                    if len(batch_records) >= CHUNK_BATCH_SIZE:
                         # Upsert in Pinecone batches (50 at a time)
                         for upsert_start in range(0, len(batch_records), upsert_batch_size):
                             upsert_batch = batch_records[upsert_start:upsert_start + upsert_batch_size]
                             try:
                                 pinecone_client.upsert_texts(upsert_batch)
-                                logger.info(f"    ✓ Upserted {len(upsert_batch)} records (chunks {chunk_batch_start + upsert_start}-{chunk_batch_start + upsert_start + len(upsert_batch) - 1})")
+                                first_chunk_idx = chunk_index - len(batch_records) + upsert_start
+                                last_chunk_idx = first_chunk_idx + len(upsert_batch) - 1
+                                logger.info(f"    ✓ Upserted {len(upsert_batch)} records (chunks {first_chunk_idx}-{last_chunk_idx})")
                             except Exception as e:
                                 logger.error(f"    ✗ Failed to upsert batch: {e}")
 
                         # Clear THIS batch from memory immediately
                         del batch_records
-                        del chunk_batch
+                        batch_records = []  # Reset for next batch
                         # Force garbage collection after each chunk batch
                         gc.collect()
+
+                # Upsert any remaining chunks in the final batch
+                if batch_records:
+                    for upsert_start in range(0, len(batch_records), upsert_batch_size):
+                        upsert_batch = batch_records[upsert_start:upsert_start + upsert_batch_size]
+                        try:
+                            pinecone_client.upsert_texts(upsert_batch)
+                            first_chunk_idx = chunk_index - len(batch_records) + upsert_start
+                            last_chunk_idx = first_chunk_idx + len(upsert_batch) - 1
+                            logger.info(f"    ✓ Upserted {len(upsert_batch)} records (chunks {first_chunk_idx}-{last_chunk_idx})")
+                        except Exception as e:
+                            logger.error(f"    ✗ Failed to upsert batch: {e}")
+                    del batch_records
+                    gc.collect()
+                
+                logger.info(f"  Transcript {transcript_id}: {total_chunks_processed} chunks processed")
 
                 transcripts_processed += 1
                 
                 # Clear ALL transcript data from memory after processing all chunks
                 del transcript_text
-                del chunks
                 del clients
                 del participants
                 del title
