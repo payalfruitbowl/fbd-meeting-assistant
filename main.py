@@ -907,8 +907,8 @@ async def run_daily_sync_background():
                         logger.warning(f"Failed to fetch transcript {transcript_id}: {e}")
                         full_transcripts.append(transcript_info)
 
-            # Process and store transcripts
-            all_records = []
+            # Process and store transcripts incrementally (one at a time to reduce memory usage)
+            # This prevents memory spikes by processing and upserting each transcript immediately
 
             for transcript in full_transcripts:
                 transcript_id = transcript.get("id")
@@ -965,7 +965,8 @@ async def run_daily_sync_background():
                         if attendee.get("email")
                     ]
 
-                # Create records for each chunk
+                # Create records for THIS transcript only (not accumulating all transcripts)
+                transcript_records = []
                 for i, chunk_text_content in enumerate(chunks):
                     record_id = f"meeting_{transcript_id}#chunk_{i}"
 
@@ -985,24 +986,30 @@ async def run_daily_sync_background():
                             "chunk_text": chunk_text_content[:200]
                         }
                     }
-                    all_records.append(record)
+                    transcript_records.append(record)
                     chunks_created += 1
 
-            # Upsert records in batches
-            if all_records:
-                logger.info(f"Upserting {len(all_records)} records to Pinecone...")
-                batch_size = 50
+                # Upsert THIS transcript's chunks immediately (don't accumulate all transcripts)
+                if transcript_records:
+                    logger.info(f"  Upserting {len(transcript_records)} chunks for transcript {transcript_id}...")
+                    batch_size = 50
 
-                for i in range(0, len(all_records), batch_size):
-                    batch = all_records[i:i + batch_size]
-                    try:
-                        pinecone_client.upsert_texts(batch)
-                        logger.info(f"  ✓ Upserted batch {i//batch_size + 1} ({len(batch)} records)")
-                    except Exception as e:
-                        logger.error(f"  ✗ Failed to upsert batch {i//batch_size + 1}: {e}")
+                    for i in range(0, len(transcript_records), batch_size):
+                        batch = transcript_records[i:i + batch_size]
+                        try:
+                            pinecone_client.upsert_texts(batch)
+                            logger.info(f"    ✓ Upserted batch {i//batch_size + 1} ({len(batch)} records)")
+                        except Exception as e:
+                            logger.error(f"    ✗ Failed to upsert batch {i//batch_size + 1}: {e}")
 
-                transcripts_processed = len(full_transcripts)
-                logger.info(f"✓ Successfully stored {chunks_created} chunks from {transcripts_processed} transcripts")
+                    transcripts_processed += 1
+                    # Clear the records from memory immediately after upserting
+                    del transcript_records
+                    # Also clear transcript data we no longer need
+                    del transcript_text
+                    del chunks
+
+            logger.info(f"✓ Successfully stored {chunks_created} chunks from {transcripts_processed} transcripts")
         else:
             logger.info("No new transcripts found for the past day")
 
