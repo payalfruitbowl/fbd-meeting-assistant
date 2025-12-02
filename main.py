@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import logging
 import json
 import asyncio
+import gc
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Any
 
@@ -894,52 +895,43 @@ async def run_daily_sync_background():
         if transcript_list:
             logger.info(f"Found {len(transcript_list)} transcripts to process")
 
-            # Fetch full transcript details
-            full_transcripts = []
+            # Process transcripts one at a time: fetch → process → upsert → clear
+            # This ensures only ONE full transcript is in memory at any time
+            # CRITICAL: This prevents memory spikes by never accumulating all transcripts
+            
             for transcript_info in transcript_list:
                 transcript_id = transcript_info.get("id")
-                if transcript_id:
-                    try:
-                        full_transcript = await fireflies_client.get_transcript_details(transcript_id)
-                        full_transcript.update(transcript_info)
-                        full_transcripts.append(full_transcript)
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch transcript {transcript_id}: {e}")
-                        full_transcripts.append(transcript_info)
-
-            # Process and store transcripts incrementally (one at a time to reduce memory usage)
-            # This prevents memory spikes by processing and upserting each transcript immediately
-
-            for transcript in full_transcripts:
-                transcript_id = transcript.get("id")
                 if not transcript_id:
                     continue
 
-                # Extract text (with cleaning)
-                transcript_text = extract_transcript_text(transcript, clean=True)
-                if not transcript_text.strip():
-                    logger.warning(f"Skipping transcript {transcript_id}: No text content")
+                # Fetch full transcript details for THIS transcript only
+                try:
+                    full_transcript = await fireflies_client.get_transcript_details(transcript_id)
+                    full_transcript.update(transcript_info)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch full transcript {transcript_id}: {e}")
+                    # Skip this transcript if we can't fetch details
                     continue
 
-                # Chunk the text
-                chunk_size = 2500
-                overlap = 200
-                chunks = chunk_text(transcript_text, chunk_size=chunk_size, overlap=overlap)
-                logger.info(f"  Transcript {transcript_id}: {len(chunks)} chunks")
+                # Extract text (with cleaning) - do this immediately
+                transcript_text = extract_transcript_text(full_transcript, clean=True)
+                if not transcript_text.strip():
+                    logger.warning(f"Skipping transcript {transcript_id}: No text content")
+                    # Clear full_transcript from memory before moving to next
+                    del full_transcript
+                    continue
 
-                # Identify clients
-                clients = identify_clients(transcript, data_processor)
+                # Identify clients (need full_transcript for this)
+                clients = identify_clients(full_transcript, data_processor)
                 if clients:
                     logger.info(f"  Identified clients: {', '.join(clients)}")
 
                 # Extract date and create numeric timestamp for filtering
-                date_str = transcript.get("dateString") or transcript.get("date", "")
-                date_timestamp = None  # Unix timestamp for numeric filtering
+                date_str = full_transcript.get("dateString") or full_transcript.get("date", "")
+                date_timestamp = None
 
                 if isinstance(date_str, str) and "T" in date_str:
-                    # Extract date part only (YYYY-MM-DD)
                     date_str = date_str.split("T")[0]
-                    # Create timestamp for numeric filtering (Pinecone requires numbers for $lt/$gt)
                     try:
                         from datetime import datetime as dt
                         date_obj = dt.strptime(date_str, "%Y-%m-%d")
@@ -947,7 +939,6 @@ async def run_daily_sync_background():
                     except Exception as e:
                         logger.warning(f"Failed to parse date {date_str}: {e}")
                 elif date_str:
-                    # Try to parse if it's already in YYYY-MM-DD format
                     try:
                         from datetime import datetime as dt
                         date_obj = dt.strptime(date_str, "%Y-%m-%d")
@@ -956,58 +947,88 @@ async def run_daily_sync_background():
                         pass
 
                 # Get title and participants
-                title = transcript.get("title", "Untitled Meeting")
-                participants = transcript.get("participants", [])
-                if not participants and transcript.get("meeting_attendees"):
+                title = full_transcript.get("title", "Untitled Meeting")
+                participants = full_transcript.get("participants", [])
+                if not participants and full_transcript.get("meeting_attendees"):
                     participants = [
                         attendee.get("email")
-                        for attendee in transcript.get("meeting_attendees", [])
+                        for attendee in full_transcript.get("meeting_attendees", [])
                         if attendee.get("email")
                     ]
 
-                # Create records for THIS transcript only (not accumulating all transcripts)
-                transcript_records = []
-                for i, chunk_text_content in enumerate(chunks):
-                    record_id = f"meeting_{transcript_id}#chunk_{i}"
+                # Clear full_transcript from memory NOW - we have all the metadata we need
+                del full_transcript
 
-                    record = {
-                        "id": record_id,
-                        "text": chunk_text_content,
-                        "metadata": {
-                            "meeting_id": transcript_id,
-                            "date": date_str,
-                            "date_timestamp": date_timestamp,
-                            "client": clients,
-                            "title": title,
-                            "participants": participants,
-                            "chunk_index": i,
-                            "total_chunks": len(chunks),
-                            "content": chunk_text_content,
-                            "chunk_text": chunk_text_content[:200]
+                # Chunk the text (this creates a list of strings - relatively lightweight)
+                chunk_size = 2500
+                overlap = 200
+                chunks = chunk_text(transcript_text, chunk_size=chunk_size, overlap=overlap)
+                total_chunks = len(chunks)
+                logger.info(f"  Transcript {transcript_id}: {total_chunks} chunks")
+
+                # Process chunks in small batches to minimize memory usage
+                # CRITICAL: Only process 10 chunks at a time, then upsert and clear
+                CHUNK_BATCH_SIZE = 10  # Process 10 chunks at a time
+                upsert_batch_size = 50  # Pinecone batch size for upserting
+
+                for chunk_batch_start in range(0, total_chunks, CHUNK_BATCH_SIZE):
+                    chunk_batch_end = min(chunk_batch_start + CHUNK_BATCH_SIZE, total_chunks)
+                    chunk_batch = chunks[chunk_batch_start:chunk_batch_end]
+                    
+                    # Create records for THIS batch of chunks only (not all chunks)
+                    batch_records = []
+                    for i, chunk_text_content in enumerate(chunk_batch):
+                        chunk_index = chunk_batch_start + i
+                        record_id = f"meeting_{transcript_id}#chunk_{chunk_index}"
+
+                        record = {
+                            "id": record_id,
+                            "text": chunk_text_content,
+                            "metadata": {
+                                "meeting_id": transcript_id,
+                                "date": date_str,
+                                "date_timestamp": date_timestamp,
+                                "client": clients,
+                                "title": title,
+                                "participants": participants,
+                                "chunk_index": chunk_index,
+                                "total_chunks": total_chunks,
+                                "content": chunk_text_content,
+                                "chunk_text": chunk_text_content[:200]
+                            }
                         }
-                    }
-                    transcript_records.append(record)
-                    chunks_created += 1
+                        batch_records.append(record)
+                        chunks_created += 1
 
-                # Upsert THIS transcript's chunks immediately (don't accumulate all transcripts)
-                if transcript_records:
-                    logger.info(f"  Upserting {len(transcript_records)} chunks for transcript {transcript_id}...")
-                    batch_size = 50
+                    # Upsert THIS batch immediately (don't accumulate all chunks)
+                    if batch_records:
+                        # Upsert in Pinecone batches (50 at a time)
+                        for upsert_start in range(0, len(batch_records), upsert_batch_size):
+                            upsert_batch = batch_records[upsert_start:upsert_start + upsert_batch_size]
+                            try:
+                                pinecone_client.upsert_texts(upsert_batch)
+                                logger.info(f"    ✓ Upserted {len(upsert_batch)} records (chunks {chunk_batch_start + upsert_start}-{chunk_batch_start + upsert_start + len(upsert_batch) - 1})")
+                            except Exception as e:
+                                logger.error(f"    ✗ Failed to upsert batch: {e}")
 
-                    for i in range(0, len(transcript_records), batch_size):
-                        batch = transcript_records[i:i + batch_size]
-                        try:
-                            pinecone_client.upsert_texts(batch)
-                            logger.info(f"    ✓ Upserted batch {i//batch_size + 1} ({len(batch)} records)")
-                        except Exception as e:
-                            logger.error(f"    ✗ Failed to upsert batch {i//batch_size + 1}: {e}")
+                        # Clear THIS batch from memory immediately
+                        del batch_records
+                        del chunk_batch
+                        # Force garbage collection after each chunk batch
+                        gc.collect()
 
-                    transcripts_processed += 1
-                    # Clear the records from memory immediately after upserting
-                    del transcript_records
-                    # Also clear transcript data we no longer need
-                    del transcript_text
-                    del chunks
+                transcripts_processed += 1
+                
+                # Clear ALL transcript data from memory after processing all chunks
+                del transcript_text
+                del chunks
+                del clients
+                del participants
+                del title
+                del date_str
+                
+                # Final garbage collection after each transcript
+                gc.collect()
 
             logger.info(f"✓ Successfully stored {chunks_created} chunks from {transcripts_processed} transcripts")
         else:
