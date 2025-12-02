@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 import logging
 import json
+import asyncio
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Any
 
@@ -736,8 +737,6 @@ async def delete_conversation(
 # Daily Sync Endpoints
 # ============================================================================
 
-from fastapi import BackgroundTasks
-
 # Helper functions for daily sync (reused from backfill_transcripts.py)
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
     """Split text into fixed-size chunks with overlap."""
@@ -1034,20 +1033,34 @@ async def run_daily_sync_background():
 
 
 @app.post("/sync/daily")
-async def sync_daily(background_tasks: BackgroundTasks):
+async def sync_daily():
     """
     Daily sync endpoint for n8n scheduled trigger.
 
+    Uses asyncio.create_task() instead of BackgroundTasks for better resilience.
+    The task runs independently in the event loop and is not tied to the request lifecycle.
+    This makes it more resilient than BackgroundTasks which are tied to request context.
+    
     Returns immediately (202 Accepted) and processes sync in background.
     This prevents timeouts - the sync can take as long as needed!
 
     Returns:
         JSON response with status "accepted" - processing continues in background
     """
-    # Add background task - this will run independently of the HTTP request
-    background_tasks.add_task(run_daily_sync_background)
+    # Create a fire-and-forget task that runs independently in the event loop
+    # This is more resilient than BackgroundTasks - not tied to request lifecycle
+    task = asyncio.create_task(run_daily_sync_background())
+    
+    # Add error callback to log any unhandled exceptions
+    def log_task_error(task):
+        try:
+            task.result()  # This will raise if task failed
+        except Exception as e:
+            logger.error(f"Background sync task failed: {e}", exc_info=True)
+    
+    task.add_done_callback(log_task_error)
 
-    logger.info("Daily sync request received - processing in background")
+    logger.info("Daily sync request received - processing in background task")
 
     return JSONResponse(
         status_code=202,  # 202 Accepted - processing in background
