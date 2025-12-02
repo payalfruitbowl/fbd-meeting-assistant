@@ -867,21 +867,38 @@ async def run_daily_sync_background():
 
 
 @app.post("/sync/daily")
-async def sync_daily(background_tasks: BackgroundTasks):
+async def sync_daily():
     """
     Daily sync endpoint for n8n scheduled trigger.
-    
+
     Returns immediately (202 Accepted) and processes sync in background.
     This prevents timeouts - the sync can take as long as needed!
-    
+
     Returns:
         JSON response with status "accepted" - processing continues in background
     """
+    logger.info("Daily sync request received - testing simple version")
+
+    return JSONResponse(
+        status_code=202,  # 202 Accepted - processing in background
+        content={
+            "status": "accepted",
+            "message": "Daily sync started in background (simple version)",
+            "note": "Processing will continue even if this request completes. Check logs for progress."
+        }
+    )
+
+
+@app.post("/sync/daily-full")
+async def sync_daily_full(background_tasks: BackgroundTasks):
+    """
+    Full daily sync endpoint with background processing.
+    """
     # Add background task - this will run independently of the HTTP request
     background_tasks.add_task(run_daily_sync_background)
-    
+
     logger.info("Daily sync request received - processing in background")
-    
+
     return JSONResponse(
         status_code=202,  # 202 Accepted - processing in background
         content={
