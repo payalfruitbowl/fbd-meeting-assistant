@@ -1122,37 +1122,30 @@ async def sync_daily():
     """
     Daily sync endpoint for n8n scheduled trigger.
 
-    Uses asyncio.create_task() instead of BackgroundTasks for better resilience.
-    The task runs independently in the event loop and is not tied to the request lifecycle.
-    This makes it more resilient than BackgroundTasks which are tied to request context.
+    Uses Celery to enqueue the sync task to a separate worker process.
+    This runs in a completely separate process with its own memory space,
+    preventing memory issues in the main application.
     
-    Returns immediately (202 Accepted) and processes sync in background.
+    Returns immediately (202 Accepted) and processes sync in background worker.
     This prevents timeouts - the sync can take as long as needed!
 
     Returns:
-        JSON response with status "accepted" - processing continues in background
+        JSON response with status "accepted" - processing continues in background worker
     """
-    # Create a fire-and-forget task that runs independently in the event loop
-    # This is more resilient than BackgroundTasks - not tied to request lifecycle
-    task = asyncio.create_task(run_daily_sync_background())
+    from app.tasks import daily_sync_task
     
-    # Add error callback to log any unhandled exceptions
-    def log_task_error(task):
-        try:
-            task.result()  # This will raise if task failed
-        except Exception as e:
-            logger.error(f"Background sync task failed: {e}", exc_info=True)
+    # Enqueue the task to Celery worker (runs in separate process)
+    task = daily_sync_task.delay()
     
-    task.add_done_callback(log_task_error)
-
-    logger.info("Daily sync request received - processing in background task")
+    logger.info(f"Daily sync request received - enqueued to Celery worker (task ID: {task.id})")
 
     return JSONResponse(
         status_code=202,  # 202 Accepted - processing in background
         content={
             "status": "accepted",
-            "message": "Daily sync started in background",
-            "note": "Processing will continue even if this request completes. Check logs for progress."
+            "message": "Daily sync started in background worker",
+            "task_id": task.id,
+            "note": "Processing will continue in separate worker process. Check logs for progress."
         }
     )
 

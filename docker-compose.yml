@@ -2,23 +2,32 @@ version: '3.8'
 
 services:
   backend:
+    # Uses Dockerfile which runs supervisor to manage both:
+    # - uvicorn (FastAPI app) on port 8000
+    # - celery worker (background tasks) connected to Upstash Redis
     build:
       context: .
       dockerfile: Dockerfile
     container_name: fruitbowl-backend
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
       - FIREFLIES_API_KEY=${FIREFLIES_API_KEY}
       - GROQ_API_KEY=${GROQ_API_KEY}
       - PINECONE_API_KEY=${PINECONE_API_KEY}
       - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-https://fbd-meeting-assistant-frontend.onrender.com}
       - OUTPUT_DIR=/app/output
       - DEBUG=${DEBUG:-false}
     volumes:
       - ./output:/app/output
       - ./output-2:/app/output-2
+      - ./logs:/var/log/supervisor  # Supervisor logs (uvicorn + celery)
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

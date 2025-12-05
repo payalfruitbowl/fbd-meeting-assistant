@@ -13,4 +13,6 @@ psycopg2-binary
 supabase
 python-jose[cryptography]
 passlib[bcrypt]
+celery[redis]
+redis
 
