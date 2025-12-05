@@ -1,26 +1,30 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, useEffect, useRef } from 'react'
+import { useRouter, usePathname } from 'next/navigation'
 import { signIn, isAuthenticated } from '../../components/auth'
 import Link from 'next/link'
 
 export default function SignInPage() {
   const router = useRouter()
+  const pathname = usePathname()
   const [authChecked, setAuthChecked] = useState(false)
+  const redirectAttempted = useRef(false) // Prevent multiple redirects
 
   useEffect(() => {
     // Only check auth once we're on client side and prevent redirect loops
-    if (typeof window !== 'undefined') {
+    if (typeof window !== 'undefined' && !redirectAttempted.current) {
       const auth = isAuthenticated()
       setAuthChecked(true)
 
-      // Only redirect if authenticated - this prevents redirect loops
-      if (auth) {
-        router.push('/')
+      // Only redirect if authenticated AND we're actually on the signin page
+      // Use replace instead of push to avoid history stack issues
+      if (auth && pathname === '/signin') {
+        redirectAttempted.current = true
+        router.replace('/')
       }
     }
-  }, [router])
+  }, [router, pathname])
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
@@ -34,12 +38,27 @@ export default function SignInPage() {
     try {
       await signIn(email, password)
       // Redirect to chat after successful signin
-      router.push('/')
+      router.replace('/')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Sign in failed')
     } finally {
       setLoading(false)
     }
+  }
+
+  // Show loading state while checking auth
+  if (!authChecked) {
+    return (
+      <div style={{
+        minHeight: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: '#0f172a',
+      }}>
+        <div style={{ color: '#94a3b8' }}>Loading...</div>
+      </div>
+    )
   }
 
   return (
