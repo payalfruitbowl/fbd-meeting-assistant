@@ -7,11 +7,18 @@ import Link from 'next/link'
 
 export default function SignInPage() {
   const router = useRouter()
+  const [authChecked, setAuthChecked] = useState(false)
 
   useEffect(() => {
-    // Redirect to home if already authenticated
-    if (isAuthenticated()) {
-      router.push('/')
+    // Only check auth once we're on client side and prevent redirect loops
+    if (typeof window !== 'undefined') {
+      const auth = isAuthenticated()
+      setAuthChecked(true)
+
+      // Only redirect if authenticated - this prevents redirect loops
+      if (auth) {
+        router.push('/')
+      }
     }
   }, [router])
   const [email, setEmail] = useState('')

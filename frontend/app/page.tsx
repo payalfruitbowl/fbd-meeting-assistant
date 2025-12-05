@@ -9,19 +9,25 @@ export default function Home() {
   const router = useRouter()
   const [isClient, setIsClient] = useState(false)
   const [isAuth, setIsAuth] = useState(false)
+  const [authChecked, setAuthChecked] = useState(false)
 
   useEffect(() => {
     setIsClient(true)
-    const auth = isAuthenticated()
-    setIsAuth(auth)
-    
-    if (!auth) {
-      router.push('/signin')
+
+    // Only check auth once we're on client side
+    if (typeof window !== 'undefined') {
+      const auth = isAuthenticated()
+      setIsAuth(auth)
+      setAuthChecked(true)
+
+      if (!auth) {
+        router.push('/signin')
+      }
     }
   }, [router])
 
-  // Show nothing while checking auth (prevents flash and hydration errors)
-  if (!isClient || !isAuth) {
+  // Show loading while checking auth or if not authenticated
+  if (!isClient || !authChecked || !isAuth) {
     return (
       <main style={{
         minHeight: '100vh',
@@ -31,7 +37,9 @@ export default function Home() {
         alignItems: 'center',
         justifyContent: 'center',
       }}>
-        <div style={{ color: 'var(--text-secondary)' }}>Loading...</div>
+        <div style={{ color: 'var(--text-secondary)' }}>
+          {!authChecked ? 'Checking authentication...' : 'Redirecting to sign in...'}
+        </div>
       </main>
     )
   }
